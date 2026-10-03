@@ -224,7 +224,7 @@ class Approval(models.Model):
         ('approved', '已通过'),
         ('rejected', '已拒绝'),
     ]
-    
+
     stock_out = models.ForeignKey(
         StockOut, on_delete=models.CASCADE,
         related_name='approvals', verbose_name='出库记录'
@@ -237,12 +237,140 @@ class Approval(models.Model):
     remark = models.TextField('审批意见', blank=True)
     created_at = models.DateTimeField('创建时间', auto_now_add=True)
     updated_at = models.DateTimeField('更新时间', auto_now=True)
-    
+
     class Meta:
         db_table = 'wh_approval'
         verbose_name = '审批记录'
         verbose_name_plural = verbose_name
         ordering = ['-created_at']
-    
+
     def __str__(self):
         return f"{self.stock_out} - {self.get_status_display()}"
+
+
+# ==================== 专用设备占用申请与分配 ====================
+
+
+class EquipmentApplication(models.Model):
+    """专用设备占用申请（一起案件对应一条申请）"""
+
+    LEVEL_CHOICES = [
+        ('major', '重大案件'),
+        ('important', '重要案件'),
+        ('general', '一般案件'),
+    ]
+    STATUS_CHOICES = [
+        ('pending', '待分配'),
+        ('allocated', '已占用'),
+        ('withdrawn', '已撤回'),
+        ('released', '已释放'),
+    ]
+
+    applicant = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True,
+        related_name='equipment_applications', verbose_name='申请人'
+    )
+    goods = models.ForeignKey(
+        Goods, on_delete=models.CASCADE,
+        related_name='equipment_applications', verbose_name='专用设备'
+    )
+    case_name = models.CharField('案件名称', max_length=100)
+    case_level = models.CharField('案件等级', max_length=20, choices=LEVEL_CHOICES, default='general')
+    requested_qty = models.DecimalField('申请数量', max_digits=12, decimal_places=2)
+    minimum_qty = models.DecimalField('最低保障量', max_digits=12, decimal_places=2, default=0)
+    committed_at = models.DateTimeField('承诺时间')
+    allocated_qty = models.DecimalField('已占用数量', max_digits=12, decimal_places=2, default=0)
+    status = models.CharField('状态', max_length=20, choices=STATUS_CHOICES, default='pending')
+    created_at = models.DateTimeField('创建时间', auto_now_add=True)
+    updated_at = models.DateTimeField('更新时间', auto_now=True)
+
+    class Meta:
+        db_table = 'wh_equipment_application'
+        verbose_name = '专用设备占用申请'
+        verbose_name_plural = verbose_name
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.case_name} - {self.goods.name} - {self.requested_qty}"
+
+
+class AllocationPlan(models.Model):
+    """设备分配方案（预览草稿经有权限人员确认后生效）"""
+
+    STATUS_CHOICES = [
+        ('draft', '待确认'),
+        ('confirmed', '已确认'),
+        ('superseded', '已作废'),
+    ]
+
+    goods = models.ForeignKey(
+        Goods, on_delete=models.CASCADE,
+        related_name='allocation_plans', verbose_name='专用设备'
+    )
+    status = models.CharField('状态', max_length=20, choices=STATUS_CHOICES, default='draft')
+    total_available = models.DecimalField('生成时可用库存', max_digits=12, decimal_places=2)
+    snapshot = models.JSONField('生成快照', default=dict)
+    invalid_reason = models.CharField('作废原因', max_length=200, blank=True)
+    created_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True,
+        related_name='created_allocation_plans', verbose_name='预览生成人'
+    )
+    confirmed_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='confirmed_allocation_plans', verbose_name='确认人'
+    )
+    confirmed_at = models.DateTimeField('确认时间', null=True, blank=True)
+    created_at = models.DateTimeField('创建时间', auto_now_add=True)
+    updated_at = models.DateTimeField('更新时间', auto_now=True)
+
+    class Meta:
+        db_table = 'wh_allocation_plan'
+        verbose_name = '设备分配方案'
+        verbose_name_plural = verbose_name
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.goods.name}分配方案#{self.id} - {self.get_status_display()}"
+
+
+class AllocationItem(models.Model):
+    """分配方案明细：每条申请一行，记录算法结果与人工调整痕迹"""
+
+    RESULT_CHOICES = [
+        ('full', '足额分配'),
+        ('partial', '部分满足'),
+        ('none', '未分配'),
+    ]
+
+    plan = models.ForeignKey(
+        AllocationPlan, on_delete=models.CASCADE,
+        related_name='items', verbose_name='所属方案'
+    )
+    application = models.ForeignKey(
+        EquipmentApplication, on_delete=models.PROTECT,
+        related_name='allocation_items', verbose_name='占用申请'
+    )
+    rank = models.PositiveIntegerField('分配顺位')
+    requested_qty = models.DecimalField('申请数量', max_digits=12, decimal_places=2)
+    minimum_qty = models.DecimalField('最低保障量', max_digits=12, decimal_places=2)
+    allocated_qty = models.DecimalField('分配数量', max_digits=12, decimal_places=2, default=0)
+    result = models.CharField('满足结果', max_length=20, choices=RESULT_CHOICES, default='none')
+    reason = models.CharField('分配说明', max_length=500, blank=True)
+    is_manual_adjusted = models.BooleanField('是否人工调整', default=False)
+    adjusted_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='adjusted_allocation_items', verbose_name='调整人'
+    )
+    adjust_reason = models.CharField('人工调整原因', max_length=200, blank=True)
+    created_at = models.DateTimeField('创建时间', auto_now_add=True)
+    updated_at = models.DateTimeField('更新时间', auto_now=True)
+
+    class Meta:
+        db_table = 'wh_allocation_item'
+        verbose_name = '分配方案明细'
+        verbose_name_plural = verbose_name
+        ordering = ['rank']
+        unique_together = [['plan', 'application']]
+
+    def __str__(self):
+        return f"方案#{self.plan_id} 顺位{self.rank} - {self.application.case_name} - {self.allocated_qty}"

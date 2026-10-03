@@ -1,8 +1,13 @@
 """
 仓库管理序列化器
 """
+from decimal import Decimal
+
 from rest_framework import serializers
-from .models import Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval
+from .models import (
+    Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval,
+    EquipmentApplication, AllocationPlan, AllocationItem,
+)
 
 
 class UnitSerializer(serializers.ModelSerializer):
@@ -200,3 +205,118 @@ class ApprovalSerializer(serializers.ModelSerializer):
             'id', 'stock_out', 'approver', 'approver_name',
             'status', 'status_display', 'remark', 'created_at', 'updated_at'
         ]
+
+
+# ==================== 专用设备占用申请与分配 ====================
+
+
+class EquipmentApplicationSerializer(serializers.ModelSerializer):
+    """专用设备占用申请只读序列化器"""
+    goods_name = serializers.CharField(source='goods.name', read_only=True)
+    applicant_name = serializers.CharField(source='applicant.username', read_only=True)
+    case_level_display = serializers.CharField(source='get_case_level_display', read_only=True)
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+
+    class Meta:
+        model = EquipmentApplication
+        fields = [
+            'id', 'goods', 'goods_name', 'applicant', 'applicant_name',
+            'case_name', 'case_level', 'case_level_display',
+            'requested_qty', 'minimum_qty', 'committed_at',
+            'allocated_qty', 'status', 'status_display',
+            'created_at', 'updated_at',
+        ]
+
+
+class EquipmentApplicationCreateSerializer(serializers.Serializer):
+    """专用设备占用申请创建/更新序列化器"""
+    goods = serializers.IntegerField(required=True, error_messages={'required': '请选择专用设备'})
+    case_name = serializers.CharField(min_length=1, max_length=100, required=True, error_messages={
+        'required': '请输入案件名称',
+        'blank': '案件名称不能为空',
+        'max_length': '案件名称最多100个字',
+    })
+    case_level = serializers.ChoiceField(
+        choices=['major', 'important', 'general'], required=True,
+        error_messages={'required': '请选择案件等级', 'invalid_choice': '案件等级无效'},
+    )
+    requested_qty = serializers.DecimalField(
+        max_digits=12, decimal_places=2, min_value=Decimal('0.01'), required=True,
+        error_messages={'required': '请输入申请数量', 'min_value': '申请数量必须大于0'},
+    )
+    minimum_qty = serializers.DecimalField(
+        max_digits=12, decimal_places=2, min_value=Decimal('0'), required=False,
+    )
+    committed_at = serializers.DateTimeField(
+        required=True, error_messages={'required': '请选择承诺时间', 'invalid': '承诺时间格式无效'},
+    )
+
+    def validate_goods(self, value):
+        if not Goods.objects.filter(pk=value, is_active=True).exists():
+            raise serializers.ValidationError('专用设备不存在或已停用')
+        return value
+
+    def validate(self, attrs):
+        minimum = attrs.get('minimum_qty', Decimal('0')) or Decimal('0')
+        requested = attrs['requested_qty']
+        if minimum > requested:
+            raise serializers.ValidationError({'minimum_qty': '最低保障量不能超过申请数量'})
+        attrs['minimum_qty'] = minimum
+        return attrs
+
+
+class AllocationItemSerializer(serializers.ModelSerializer):
+    """分配方案明细序列化器"""
+    application_id = serializers.IntegerField(source='application.id', read_only=True)
+    case_name = serializers.CharField(source='application.case_name', read_only=True)
+    case_level = serializers.CharField(source='application.case_level', read_only=True)
+    case_level_display = serializers.CharField(
+        source='application.get_case_level_display', read_only=True
+    )
+    committed_at = serializers.DateTimeField(source='application.committed_at', read_only=True)
+    result_display = serializers.CharField(source='get_result_display', read_only=True)
+    adjusted_by_name = serializers.CharField(source='adjusted_by.username', read_only=True)
+
+    class Meta:
+        model = AllocationItem
+        fields = [
+            'id', 'application_id', 'case_name', 'case_level', 'case_level_display',
+            'committed_at', 'rank', 'requested_qty', 'minimum_qty',
+            'allocated_qty', 'result', 'result_display', 'reason',
+            'is_manual_adjusted', 'adjusted_by_name', 'adjust_reason',
+        ]
+
+
+class AllocationPlanSerializer(serializers.ModelSerializer):
+    """分配方案序列化器（详情内嵌明细）"""
+    goods_name = serializers.CharField(source='goods.name', read_only=True)
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+    created_by_name = serializers.CharField(source='created_by.username', read_only=True)
+    confirmed_by_name = serializers.CharField(source='confirmed_by.username', read_only=True)
+    items = AllocationItemSerializer(many=True, read_only=True)
+    rule_version = serializers.SerializerMethodField()
+
+    class Meta:
+        model = AllocationPlan
+        fields = [
+            'id', 'goods', 'goods_name', 'status', 'status_display',
+            'total_available', 'snapshot', 'rule_version',
+            'created_by', 'created_by_name', 'confirmed_by', 'confirmed_by_name',
+            'confirmed_at', 'created_at', 'updated_at', 'items',
+        ]
+
+    def get_rule_version(self, obj):
+        return obj.snapshot.get('rule_version') if isinstance(obj.snapshot, dict) else None
+
+
+class AllocationAdjustSerializer(serializers.Serializer):
+    """人工调整明细入参"""
+    allocated_qty = serializers.DecimalField(
+        max_digits=12, decimal_places=2, min_value=Decimal('0'), required=True,
+        error_messages={'required': '请输入调整后的数量', 'min_value': '分配数量不能为负'},
+    )
+    adjust_reason = serializers.CharField(min_length=1, max_length=200, required=True, error_messages={
+        'required': '请填写人工调整原因',
+        'blank': '人工调整原因不能为空',
+    })
+    confirm_below_minimum = serializers.BooleanField(required=False, default=False)

@@ -10,13 +10,29 @@ from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from apps.core.response import success_response, error_response
-from .models import Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval
+from .allocation import (
+    AllocationError,
+    adjust_item,
+    build_plan,
+    confirm_plan,
+    release_application,
+    withdraw_application,
+)
+from .models import (
+    Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval,
+    EquipmentApplication, AllocationPlan, AllocationItem,
+)
 from .serializers import (
     UnitSerializer, UnitCreateSerializer,
     CategorySerializer, CategoryCreateSerializer,
     VarietySerializer, VarietyCreateSerializer,
     GoodsSerializer, StockInSerializer, StockOutSerializer,
-    WarningSerializer, ApprovalSerializer
+    WarningSerializer, ApprovalSerializer,
+    EquipmentApplicationSerializer,
+    EquipmentApplicationCreateSerializer,
+    AllocationPlanSerializer,
+    AllocationItemSerializer,
+    AllocationAdjustSerializer,
 )
 
 logger = logging.getLogger('apps')
@@ -636,3 +652,246 @@ class ApprovalListView(APIView):
             'page': 1,
             'page_size': 10
         })
+
+
+# ==================== 专用设备占用申请与分配 ====================
+
+
+class EquipmentApplicationListView(APIView):
+    """专用设备占用申请：列表 / 创建"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        queryset = EquipmentApplication.objects.select_related(
+            'goods', 'applicant'
+        ).all().order_by('-created_at')
+
+        goods_id = request.query_params.get('goods')
+        if goods_id:
+            queryset = queryset.filter(goods_id=goods_id)
+        status = request.query_params.get('status')
+        if status:
+            queryset = queryset.filter(status=status)
+        case_level = request.query_params.get('case_level')
+        if case_level:
+            queryset = queryset.filter(case_level=case_level)
+
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 10))
+        start = (page - 1) * page_size
+
+        total = queryset.count()
+        applications = queryset[start:start + page_size]
+        serializer = EquipmentApplicationSerializer(applications, many=True)
+
+        return success_response(data={
+            'list': serializer.data,
+            'total': total,
+            'page': page,
+            'page_size': page_size,
+        })
+
+    def post(self, request):
+        serializer = EquipmentApplicationCreateSerializer(data=request.data)
+        if not serializer.is_valid():
+            errors = serializer.errors
+            first_error = list(errors.values())[0]
+            if isinstance(first_error, list):
+                first_error = first_error[0]
+            return error_response(message=str(first_error))
+
+        data = serializer.validated_data
+        application = EquipmentApplication.objects.create(
+            applicant=request.user,
+            goods_id=data['goods'],
+            case_name=data['case_name'],
+            case_level=data['case_level'],
+            requested_qty=data['requested_qty'],
+            minimum_qty=data['minimum_qty'],
+            committed_at=data['committed_at'],
+        )
+
+        logger.info(
+            "User %s created equipment application %s for goods %s",
+            request.user.username, application.id, application.goods_id,
+        )
+        return success_response(
+            data=EquipmentApplicationSerializer(application).data, message='申请已提交'
+        )
+
+
+class EquipmentApplicationWithdrawView(APIView):
+    """撤回待分配申请：申请人本人或管理员"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        try:
+            application = EquipmentApplication.objects.get(pk=pk)
+        except EquipmentApplication.DoesNotExist:
+            return error_response(message='申请不存在', code=404)
+
+        if application.applicant_id != request.user.id and not request.user.is_admin:
+            return error_response(message='只能撤回本人提交的申请', code=403)
+
+        try:
+            withdraw_application(application.id, request.user)
+        except AllocationError as exc:
+            return error_response(message=str(exc))
+
+        application.refresh_from_db()
+        return success_response(
+            data=EquipmentApplicationSerializer(application).data, message='申请已撤回'
+        )
+
+
+class EquipmentApplicationReleaseView(APIView):
+    """释放已占用设备（管理员）：数量退回库存"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        if not request.user.is_admin:
+            return error_response(message='无权限操作，仅管理员可释放占用', code=403)
+
+        try:
+            application = EquipmentApplication.objects.get(pk=pk)
+        except EquipmentApplication.DoesNotExist:
+            return error_response(message='申请不存在', code=404)
+
+        try:
+            release_application(application.id, request.user)
+        except AllocationError as exc:
+            return error_response(message=str(exc))
+
+        application.refresh_from_db()
+        return success_response(
+            data=EquipmentApplicationSerializer(application).data, message='占用已释放，数量退回库存'
+        )
+
+
+class AllocationPlanPreviewView(APIView):
+    """生成分配预览（草稿），不改动库存与占用"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        goods_id = request.data.get('goods')
+        if not goods_id:
+            return error_response(message='请选择专用设备')
+        if not Goods.objects.filter(pk=goods_id).exists():
+            return error_response(message='专用设备不存在', code=404)
+
+        plan = build_plan(goods_id, request.user)
+        return success_response(
+            data=AllocationPlanSerializer(plan).data, message='预览已生成，待有权限人员确认'
+        )
+
+
+class AllocationPlanListView(APIView):
+    """分配方案列表"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        queryset = AllocationPlan.objects.select_related(
+            'goods', 'created_by', 'confirmed_by'
+        ).all().order_by('-created_at')
+
+        goods_id = request.query_params.get('goods')
+        if goods_id:
+            queryset = queryset.filter(goods_id=goods_id)
+        status = request.query_params.get('status')
+        if status:
+            queryset = queryset.filter(status=status)
+
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 10))
+        start = (page - 1) * page_size
+
+        total = queryset.count()
+        plans = queryset[start:start + page_size]
+        serializer = AllocationPlanSerializer(plans, many=True)
+
+        return success_response(data={
+            'list': serializer.data,
+            'total': total,
+            'page': page,
+            'page_size': page_size,
+        })
+
+
+class AllocationPlanDetailView(APIView):
+    """分配方案详情（含逐条分配说明）"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        try:
+            plan = AllocationPlan.objects.select_related(
+                'goods', 'created_by', 'confirmed_by'
+            ).prefetch_related(
+                'items__application', 'items__adjusted_by'
+            ).get(pk=pk)
+        except AllocationPlan.DoesNotExist:
+            return error_response(message='分配方案不存在', code=404)
+
+        return success_response(data=AllocationPlanSerializer(plan).data)
+
+
+class AllocationPlanConfirmView(APIView):
+    """确认方案（仅管理员）：原子写入各申请占用并扣减库存"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        if not request.user.is_admin:
+            return error_response(message='无权限确认分配方案，仅管理员可确认', code=403)
+
+        try:
+            plan = confirm_plan(pk, request.user)
+        except AllocationPlan.DoesNotExist:
+            return error_response(message='分配方案不存在', code=404)
+        except AllocationError as exc:
+            return error_response(message=str(exc))
+
+        plan = AllocationPlan.objects.select_related(
+            'goods', 'created_by', 'confirmed_by'
+        ).prefetch_related('items__application', 'items__adjusted_by').get(pk=plan.id)
+        return success_response(
+            data=AllocationPlanSerializer(plan).data, message='方案已确认，占用已原子写入'
+        )
+
+
+class AllocationItemAdjustView(APIView):
+    """人工调整草稿明细数量（仅管理员），不级联重算其他明细"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, plan_pk, item_pk):
+        if not request.user.is_admin:
+            return error_response(message='无权限调整分配方案，仅管理员可调整', code=403)
+
+        serializer = AllocationAdjustSerializer(data=request.data)
+        if not serializer.is_valid():
+            errors = serializer.errors
+            first_error = list(errors.values())[0]
+            if isinstance(first_error, list):
+                first_error = first_error[0]
+            return error_response(message=str(first_error))
+
+        try:
+            item = adjust_item(
+                plan_pk,
+                item_pk,
+                request.user,
+                serializer.validated_data['allocated_qty'],
+                serializer.validated_data['adjust_reason'],
+                serializer.validated_data.get('confirm_below_minimum', False),
+            )
+        except AllocationPlan.DoesNotExist:
+            return error_response(message='分配方案不存在', code=404)
+        except AllocationItem.DoesNotExist:
+            return error_response(message='方案明细不存在', code=404)
+        except AllocationError as exc:
+            return error_response(message=str(exc))
+
+        item = AllocationItem.objects.select_related(
+            'application', 'adjusted_by'
+        ).get(pk=item.id)
+        return success_response(
+            data=AllocationItemSerializer(item).data, message='明细已人工调整'
+        )

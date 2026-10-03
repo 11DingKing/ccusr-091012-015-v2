@@ -8,7 +8,11 @@ from .views import (
     VarietyListView, VarietyDetailView, VarietyBatchDeleteView,
     VarietyTemplateView, VarietyImportView,
     DashboardView, GoodsListView, StockInListView, StockOutListView,
-    WarningListView, ApprovalListView
+    WarningListView, ApprovalListView,
+    EquipmentApplicationListView, EquipmentApplicationWithdrawView,
+    EquipmentApplicationReleaseView,
+    AllocationPlanPreviewView, AllocationPlanListView, AllocationPlanDetailView,
+    AllocationPlanConfirmView, AllocationItemAdjustView,
 )
 
 urlpatterns = [
@@ -48,4 +52,23 @@ urlpatterns = [
     
     # 审批管理
     path('approvals/', ApprovalListView.as_view(), name='approval-list'),
+
+    # 专用设备占用申请
+    path('equipment-applications/', EquipmentApplicationListView.as_view(),
+         name='equipment-application-list'),
+    path('equipment-applications/<int:pk>/withdraw/',
+         EquipmentApplicationWithdrawView.as_view(), name='equipment-application-withdraw'),
+    path('equipment-applications/<int:pk>/release/',
+         EquipmentApplicationReleaseView.as_view(), name='equipment-application-release'),
+
+    # 分配方案：预览 → 人工调整 → 确认
+    path('allocation-plans/preview/', AllocationPlanPreviewView.as_view(),
+         name='allocation-plan-preview'),
+    path('allocation-plans/', AllocationPlanListView.as_view(), name='allocation-plan-list'),
+    path('allocation-plans/<int:pk>/', AllocationPlanDetailView.as_view(),
+         name='allocation-plan-detail'),
+    path('allocation-plans/<int:pk>/confirm/', AllocationPlanConfirmView.as_view(),
+         name='allocation-plan-confirm'),
+    path('allocation-plans/<int:plan_pk>/items/<int:item_pk>/adjust/',
+         AllocationItemAdjustView.as_view(), name='allocation-item-adjust'),
 ]
