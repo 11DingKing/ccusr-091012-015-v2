@@ -5,19 +5,26 @@ import logging
 import io
 from django.http import HttpResponse
 from rest_framework.views import APIView
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, BasePermission
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from apps.core.response import success_response, error_response
-from .models import Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval
+from .models import (
+    Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval,
+    EquipmentApplication, AllocationBatch, AllocationAdjustmentLog,
+)
 from .serializers import (
     UnitSerializer, UnitCreateSerializer,
     CategorySerializer, CategoryCreateSerializer,
     VarietySerializer, VarietyCreateSerializer,
     GoodsSerializer, StockInSerializer, StockOutSerializer,
-    WarningSerializer, ApprovalSerializer
+    WarningSerializer, ApprovalSerializer,
+    EquipmentApplicationSerializer, EquipmentApplicationCreateSerializer,
+    AllocationBatchSerializer, AllocationAdjustSerializer, OccupancyAdjustSerializer,
+    AllocationAdjustmentLogSerializer,
 )
+from . import allocation
 
 logger = logging.getLogger('apps')
 
@@ -628,11 +635,242 @@ class WarningListView(APIView):
 class ApprovalListView(APIView):
     """审批记录列表视图"""
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
         return success_response(data={
             'list': [],
             'total': 0,
             'page': 1,
             'page_size': 10
+        })
+
+
+# ==================== 专用设备分配 ====================
+
+class IsAdminUser(BasePermission):
+    """仅管理员及以上可执行确认/人工调整"""
+
+    def has_permission(self, request, view):
+        return bool(request.user and request.user.is_authenticated and request.user.is_admin)
+
+
+def _first_error(serializer):
+    errors = serializer.errors
+    first = list(errors.values())[0]
+    if isinstance(first, list):
+        first = first[0]
+    return str(first)
+
+
+class EquipmentApplicationListView(APIView):
+    """专用设备申请：登记 / 列表"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        queryset = EquipmentApplication.objects.select_related(
+            'goods', 'applicant'
+        ).all().order_by('-created_at')
+
+        goods_id = request.query_params.get('goods')
+        status = request.query_params.get('status')
+        if goods_id:
+            queryset = queryset.filter(goods_id=goods_id)
+        if status:
+            queryset = queryset.filter(status=status)
+
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 10))
+        start = (page - 1) * page_size
+
+        total = queryset.count()
+        serializer = EquipmentApplicationSerializer(queryset[start:start + page_size], many=True)
+        return success_response(data={
+            'list': serializer.data, 'total': total,
+            'page': page, 'page_size': page_size,
+        })
+
+    def post(self, request):
+        """登记申请即进入等待分配池；已有未确认预览将失效，防止按旧输入确认"""
+        serializer = EquipmentApplicationCreateSerializer(data=request.data)
+        if not serializer.is_valid():
+            return error_response(message=_first_error(serializer))
+
+        data = serializer.validated_data
+        application = EquipmentApplication.objects.create(
+            goods_id=data['goods'],
+            case_name=data['case_name'],
+            case_level=data['case_level'],
+            applicant=request.user,
+            apply_time=data['apply_time'],
+            promised_time=data['promised_time'],
+            quantity=data['quantity'],
+            minimum_guarantee=data['minimum_guarantee'],
+            remark=data.get('remark', ''),
+            status=EquipmentApplication.STATUS_WAITING,
+        )
+        allocation.invalidate_drafts(
+            data['goods'], request.user, '新申请登记'
+        )
+        logger.info(f"User {request.user.username} created equipment application {application.id}")
+        return success_response(
+            data=EquipmentApplicationSerializer(application).data, message='申请已提交，等待分配'
+        )
+
+
+class AllocationPreviewView(APIView):
+    """生成/重新生成/查看某专用设备的分配预览（不写入任何占用）"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, goods_id):
+        batch = AllocationBatch.objects.filter(goods_id=goods_id) \
+            .order_by('-created_at').prefetch_related('items__application').first()
+        if batch is None:
+            return success_response(data=None, message='暂无预览')
+        return success_response(data=AllocationBatchSerializer(batch).data)
+
+    def post(self, request, goods_id):
+        source = request.data.get('source', 'manual')
+        if source not in (AllocationBatch.SOURCE_MANUAL, AllocationBatch.SOURCE_RECALC):
+            source = AllocationBatch.SOURCE_MANUAL
+        try:
+            batch = allocation.create_preview(goods_id, request.user, source=source)
+        except allocation.AllocationError as exc:
+            return error_response(message=exc.message, code=exc.code)
+        batch = AllocationBatch.objects.prefetch_related('items__application').get(pk=batch.pk)
+        return success_response(
+            data=AllocationBatchSerializer(batch).data,
+            message='预览已生成，确认前可由管理员人工调整',
+        )
+
+
+class AllocationBatchDetailView(APIView):
+    """批次详情（含每条分配的顺位、数量与解释）"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        batch = AllocationBatch.objects.prefetch_related('items__application') \
+            .filter(pk=pk).first()
+        if batch is None:
+            return error_response(message='分配批次不存在', code=404)
+        return success_response(data=AllocationBatchSerializer(batch).data)
+
+
+class AllocationBatchAdjustView(APIView):
+    """确认前整单人工调整（仅管理员）"""
+    permission_classes = [IsAuthenticated, IsAdminUser]
+
+    def post(self, request, pk):
+        payload = request.data.get('items')
+        if not isinstance(payload, list) or not payload:
+            return error_response(message='请提交 items: [{application, quantity}] 调整清单')
+
+        adjustments = {}
+        for row in payload:
+            if not isinstance(row, dict) or 'application' not in row or 'quantity' not in row:
+                return error_response(message='调整项须包含 application 与 quantity')
+            try:
+                adjustments[int(row['application'])] = row['quantity']
+            except (TypeError, ValueError):
+                return error_response(message='申请ID格式不正确')
+
+        try:
+            batch = allocation.adjust_preview(pk, request.user, adjustments)
+        except allocation.AllocationError as exc:
+            return error_response(message=exc.message, code=exc.code)
+        batch = AllocationBatch.objects.prefetch_related('items__application').get(pk=batch.pk)
+        return success_response(data=AllocationBatchSerializer(batch).data, message='调整已保存（仍为预览）')
+
+
+class AllocationBatchConfirmView(APIView):
+    """确认预览并原子写入各申请占用（仅管理员）"""
+    permission_classes = [IsAuthenticated, IsAdminUser]
+
+    def post(self, request, pk):
+        try:
+            batch = allocation.confirm_batch(pk, request.user)
+        except allocation.AllocationError as exc:
+            return error_response(message=exc.message, code=exc.code)
+        batch = AllocationBatch.objects.prefetch_related('items__application').get(pk=batch.pk)
+        logger.info(
+            f"Admin {request.user.username} confirmed allocation batch {batch.id} "
+            f"for goods {batch.goods_id}"
+        )
+        return success_response(data=AllocationBatchSerializer(batch).data, message='分配已确认，占用已写入')
+
+
+class ApplicationWithdrawView(APIView):
+    """申请撤回：等待中直接撤回；已占用则同步释放资源"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        try:
+            app = allocation.withdraw_application(pk, request.user)
+        except allocation.AllocationError as exc:
+            return error_response(message=exc.message, code=exc.code)
+        logger.info(f"User {request.user.username} withdrew application {pk}")
+        return success_response(
+            data=EquipmentApplicationSerializer(app).data, message='申请已撤回'
+        )
+
+
+class ApplicationReturnView(APIView):
+    """设备归还：释放占用"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        try:
+            app = allocation.return_equipment(pk, request.user)
+        except allocation.AllocationError as exc:
+            return error_response(message=exc.message, code=exc.code)
+        logger.info(f"User {request.user.username} returned equipment for application {pk}")
+        return success_response(
+            data=EquipmentApplicationSerializer(app).data, message='设备已归还'
+        )
+
+
+class OccupancyAdjustView(APIView):
+    """确认后人工调整占用数量（仅管理员），调整为0即释放"""
+    permission_classes = [IsAuthenticated, IsAdminUser]
+
+    def post(self, request, pk):
+        serializer = OccupancyAdjustSerializer(data=request.data)
+        if not serializer.is_valid():
+            return error_response(message=_first_error(serializer))
+        try:
+            app = allocation.adjust_occupancy(
+                pk, request.user, serializer.validated_data['quantity']
+            )
+        except allocation.AllocationError as exc:
+            return error_response(message=exc.message, code=exc.code)
+        app = EquipmentApplication.objects.select_related('goods', 'applicant').get(pk=app.pk)
+        return success_response(
+            data=EquipmentApplicationSerializer(app).data, message='占用已调整并留痕'
+        )
+
+
+class AllocationLogView(APIView):
+    """分配全流程操作日志"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        queryset = AllocationAdjustmentLog.objects.select_related(
+            'operator', 'application'
+        ).all().order_by('-created_at')
+
+        batch_id = request.query_params.get('batch')
+        application_id = request.query_params.get('application')
+        if batch_id:
+            queryset = queryset.filter(batch_id=batch_id)
+        if application_id:
+            queryset = queryset.filter(application_id=application_id)
+
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 20))
+        start = (page - 1) * page_size
+
+        total = queryset.count()
+        serializer = AllocationAdjustmentLogSerializer(queryset[start:start + page_size], many=True)
+        return success_response(data={
+            'list': serializer.data, 'total': total,
+            'page': page, 'page_size': page_size,
         })
